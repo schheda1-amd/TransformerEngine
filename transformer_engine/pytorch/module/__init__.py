@@ -4,6 +4,7 @@
 
 """Module level PyTorch APIs"""
 from .layernorm_linear import LayerNormLinear
+from .layernorm_linear22 import LayerNormLinear22
 from .linear import Linear
 from .linear22 import Linear22
 from .grouped_linear import GroupedLinear

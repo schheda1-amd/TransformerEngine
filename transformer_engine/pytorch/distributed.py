@@ -850,7 +850,7 @@ def _scatter_along_first_dim(
 ) -> Tuple[torch.Tensor, Optional[torch.distributed.Work]]:
     """Reduce-scatter the input tensor across model parallel group."""
     world_size = get_distributed_world_size(tp_group)
-    # Bypass the function if we are using only 1 GPU.
+    # Bypass the function if we are using only 1 GPU or 1 partition.
     if world_size == 1:
         return input_, None
 
@@ -859,16 +859,35 @@ def _scatter_along_first_dim(
         dim_size[0] % world_size == 0
     ), "First dimension of the tensor should be divisible by xcd model parallel size"
 
-    dim_size[0] = dim_size[0] // world_size
+    #dim_size[0] = dim_size[0] // world_size
+    if torch.distributed.get_rank(tp_group) == 0:
+        scatter_list = [input_.chunk(world_size, dim=0)[i] for i in range(world_size)]
+    else:
+        scatter_list = None
 
     output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
     handle = torch.distributed.scatter(
         output,
-        scatter_list=[input_.chunk(world_size, dim=0)[i] for i in range(world_size)],
+        scatter_list=scatter_list,
         group=tp_group,
         async_op=async_op,
     )
     return output, handle
+
+
+def local_chunk_along_first_dim(
+    input_: torch.Tensor, tp_group: dist_group_type, async_op: bool = False
+) -> Tuple[torch.Tensor, Optional[torch.distributed.Work]]:
+    """ Chunk the tensor along the first dimension.
+    Utility function for after the row parallel layer (after allreduce)."""
+    world_size = get_distributed_world_size(tp_group)
+    rank = get_distributed_rank(tp_group)
+    assert input_.size(0) % world_size == 0, f"cannot partition tensor - \
+        check dimensions of input {input_.size(0)} and world size {world_size}."
+    chunk_size = input_.size(0) // world_size
+    start = rank * chunk_size
+    end = start + chunk_size
+    return input_[start:end]
 
 
 def _all_gather_fp8(
@@ -1090,6 +1109,42 @@ def gather_along_first_dim(
         async_op=async_op,
     )
     return out, handle
+
+
+def gather_along_last_dim(
+    input_: torch.Tensor,
+    process_group: dist_group_type,
+    async_op: bool = False,
+    quantizer: Optional[Quantizer] = None,
+    gather_list: Optional[List[torch.Tensor]] = None,
+) -> tuple[torch.Tensor, Optional[torch.distributed.Work]]:
+    """All-gather tensors and concatenate along first dimension."""
+
+    # Return immediately if no communication is required
+    world_size = get_distributed_world_size(process_group)
+    if world_size == 1:
+        if quantizer is not None and not isinstance(input_, QuantizedTensor):
+            input_ = quantizer(input_)
+        return input_, None
+
+    if gather_list is None:
+        gather_list = [torch.empty_like(input_) for _ in range(world_size)]
+
+    handle = torch.distributed.all_gather(
+        gather_list,
+        input_.contiguous(),
+        group=process_group,
+        async_op=async_op,
+    )
+
+    if async_op:
+        def _wait_cat():
+            handle.wait()
+            return torch.cat(gather_list, dim=-1)
+        return _wait_cat, handle
+    
+    output = torch.cat(gather_list, dim=-1)
+    return output, None
 
 
 def allreduce(

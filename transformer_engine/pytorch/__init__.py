@@ -67,6 +67,7 @@ def _load_library():
 
 _load_library()
 from transformer_engine.pytorch.module import LayerNormLinear
+from transformer_engine.pytorch.module import LayerNormLinear22
 from transformer_engine.pytorch.module import Linear
 from transformer_engine.pytorch.module import Linear22
 from transformer_engine.pytorch.module import LayerNormMLP
