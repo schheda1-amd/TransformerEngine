@@ -35,6 +35,7 @@ from ..distributed import (
     set_tensor_model_parallel_attributes,
     get_distributed_world_size,
     allreduce,
+    _scatter_along_first_dim,
     reduce_scatter_along_first_dim,
     gather_along_first_dim,
     is_fp8_activation_recompute_enabled,
@@ -99,6 +100,9 @@ class _Linear(torch.autograd.Function):
         fsdp_group: Union[dist_group_type, None],
         module: torch.nn.Module,
         skip_fp8_weight_update: bool,
+        xcd_group: Union[dist_group_type, None],
+        xcd_size: int,
+        physical_gpu_idx: int,
     ) -> torch.Tensor:
         # pylint: disable=missing-function-docstring
 
@@ -302,6 +306,9 @@ class _Linear(torch.autograd.Function):
             ctx.reduce_and_update_bwd_fp8_tensors = False
             ctx.owns_input = saved_inputmat is not inp
             ctx.is_input_fp8 = not own_quantized_input
+            ctx.xcd_group = xcd_group
+            ctx.xcd_size = xcd_size
+            ctx.physical_gpu_ix = physical_gpu_idx
             if ctx.fp8 and requires_grad(inp, weight, bias):
                 _first_fp8_module = FP8GlobalStateManager.IS_FIRST_FP8_MODULE
                 ctx.reduce_and_update_bwd_fp8_tensors = FP8GlobalStateManager.is_first_fp8_module()
@@ -317,6 +324,17 @@ class _Linear(torch.autograd.Function):
                 out, _ = reduce_scatter_along_first_dim(out, tp_group)
             elif tensor_parallel:
                 out, _ = allreduce(out, tp_group)
+            nvtx_range_pop(f"{nvtx_label}.row_parallel_comm")
+        elif parallel_mode == "bumblebee":
+            nvtx_range_push(f"{nvtx_label}.row_parallel_comm")
+            out, _ = allreduce(out, tp_group)
+            print('now what shapes are we seeing before?', out.shape)
+            # now scatter among intra gpu group. every rank in tp group has the entire 
+            # output matrix. now we get rid of that and scatter equal size chunks from
+            # rank 0 of each intra_gpu group.  
+            # follow sequence parallel logic for backwards
+            out, _ = _scatter_along_first_dim(out, xcd_group)
+            print('now what shapes are we seeing after?', out.shape)
             nvtx_range_pop(f"{nvtx_label}.row_parallel_comm")
 
         out = out.view(-1, *inp_shape[1:-1], out_features)
@@ -650,6 +668,9 @@ class _Linear(torch.autograd.Function):
             None,  # fsdp_group
             None,  # module
             None,  # skip_fp8_weight_update
+            None,  # xcd_group
+            None,  # xcd_size
+            None,  # physical_gpu_idx
         )
 
 
@@ -702,6 +723,7 @@ class Linear22(TransformerEngineBaseModule):
                    used to decide whether this Linear layer is Column Parallel Linear or Row
                    Parallel Linear as described `here <https://arxiv.org/pdf/1909.08053.pdf>`_.
                    When set to `None`, no communication is performed.
+                   #AMD Instinct partitioninig modes - 'bumblebee', 'starscream'
 
     Optimization parameters
     -----------------------
@@ -746,6 +768,9 @@ class Linear22(TransformerEngineBaseModule):
         ub_bulk_dgrad: bool = False,
         ub_bulk_wgrad: bool = False,
         ub_name: Optional[str] = None,
+        xcd_group: Optional[dist_group_type] = None,
+        xcd_size: int = 1,
+        physical_gpu_offset: int = 0,
     ) -> None:
         super().__init__()
 
@@ -758,6 +783,9 @@ class Linear22(TransformerEngineBaseModule):
         self.apply_bias = bias and not return_bias
         self.get_rng_state_tracker = get_rng_state_tracker
         self.rng_tracker_name = rng_tracker_name
+        self.xcd_group = xcd_group
+        self.xcd_size = xcd_size
+        self.physical_gpu_idx = physical_gpu_offset
 
         if device == "meta":
             assert parameters_split is None, "Cannot split module parameters on 'meta' device."
@@ -778,6 +806,8 @@ class Linear22(TransformerEngineBaseModule):
         if self.parallel_mode == "column":
             self.out_features = divide(self.out_features, self.tp_size)
         elif self.parallel_mode == "row":
+            self.in_features = divide(self.in_features, self.tp_size)
+        elif self.parallel_mode == "bumblebee": # mimick parallel model "row" until the end.
             self.in_features = divide(self.in_features, self.tp_size)
 
         self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
@@ -936,7 +966,8 @@ class Linear22(TransformerEngineBaseModule):
 
         # For RPL, bias has to be added after TP collectives
         # So it cannot be fused with the GEMM
-        if self.parallel_mode == "row" and self.apply_bias:
+        if (self.parallel_mode == "row" or self.parallel_mode == "bumblebee") \
+            and self.apply_bias:
             self.gemm_bias_unfused_add = True
         else:
             self.gemm_bias_unfused_add = False
@@ -950,7 +981,7 @@ class Linear22(TransformerEngineBaseModule):
                 set_tensor_model_parallel_attributes(
                     tensor=getattr(self, weight),
                     is_parallel=True,
-                    dim=1 if self.parallel_mode == "row" else 0,
+                    dim=1, # if self.parallel_mode == "row" else 0
                     stride=1,
                 )
 
@@ -1071,6 +1102,9 @@ class Linear22(TransformerEngineBaseModule):
                 self.fsdp_group,
                 self,
                 skip_fp8_weight_update,
+                self.xcd_group,
+                self.xcd_size, 
+                self.physical_gpu_idx,
             )
             out = linear_fn(*args)
         if self.gemm_bias_unfused_add:

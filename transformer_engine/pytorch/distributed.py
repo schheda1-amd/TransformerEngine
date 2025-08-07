@@ -845,6 +845,32 @@ def reduce_scatter_along_first_dim(
     return output, handle
 
 
+def _scatter_along_first_dim(
+    input_: torch.Tensor, tp_group: dist_group_type, async_op: bool = False
+) -> Tuple[torch.Tensor, Optional[torch.distributed.Work]]:
+    """Reduce-scatter the input tensor across model parallel group."""
+    world_size = get_distributed_world_size(tp_group)
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_, None
+
+    dim_size = list(input_.size())
+    assert (
+        dim_size[0] % world_size == 0
+    ), "First dimension of the tensor should be divisible by xcd model parallel size"
+
+    dim_size[0] = dim_size[0] // world_size
+
+    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+    handle = torch.distributed.scatter(
+        output,
+        scatter_list=[input_.chunk(world_size, dim=0)[i] for i in range(world_size)],
+        group=tp_group,
+        async_op=async_op,
+    )
+    return output, handle
+
+
 def _all_gather_fp8(
     input_: torch.Tensor,
     process_group: dist_group_type,

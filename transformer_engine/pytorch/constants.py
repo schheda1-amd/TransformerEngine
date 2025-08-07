@@ -64,7 +64,7 @@ QKVLayouts = (
 
 LayerTypes = ("encoder", "decoder")
 
-GemmParallelModes = ("row", "column", None)
+GemmParallelModes = ("row", "column", None, "bumblebee", "starscream")
 
 dist_group_type = torch.distributed.ProcessGroup
 
