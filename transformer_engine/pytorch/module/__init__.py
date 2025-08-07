@@ -7,6 +7,7 @@ from .layernorm_linear import LayerNormLinear
 from .layernorm_linear22 import LayerNormLinear22
 from .linear import Linear
 from .linear22 import Linear22
+from .linear44 import Linear44
 from .grouped_linear import GroupedLinear
 from .layernorm_mlp import LayerNormMLP
 from .layernorm import LayerNorm
