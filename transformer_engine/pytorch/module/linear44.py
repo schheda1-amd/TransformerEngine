@@ -776,7 +776,7 @@ class Linear44(TransformerEngineBaseModule):
         intra_xcd_size: int = 1,
         inter_xcd_group: Optional[dist_group_type] = None,
         inter_xcd_size: int = 1,
-        physical_gpu_idx: int = 0,
+        physical_gpu_offset: int = 0,
     ) -> None:
         super().__init__()
 
