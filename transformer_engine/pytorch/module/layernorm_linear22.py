@@ -42,6 +42,7 @@ from ..distributed import (
     set_tensor_model_parallel_attributes,
     get_distributed_world_size,
     allreduce,
+    local_chunk_along_first_dim,
     reduce_scatter_along_first_dim,
     gather_along_first_dim,
     gather_along_last_dim,
@@ -197,6 +198,7 @@ class _LayerNormLinear(torch.autograd.Function):
             )
 
         # Apply normalization
+        #print('normalizer shapes---', inputmat.shape, ln_weight.shape)
         nvtx_range_push(f"{nvtx_label}.norm")
         ln_out, mu, rsigma = apply_normalization(
             inputmat,
@@ -932,6 +934,7 @@ class LayerNormLinear22(TransformerEngineBaseModule):
 
         params_dtype = torch.get_default_dtype() if params_dtype is None else params_dtype
         self.in_features = in_features
+        self.og_in_features = in_features
         self.out_features = out_features
         self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
         self.normalization = normalization
@@ -977,7 +980,6 @@ class LayerNormLinear22(TransformerEngineBaseModule):
             # XCDs of the same physical GPU.
             self.out_features = divide(self.out_features, self.physical_gpu_count)
             self.in_features = divide(self.in_features, self.xcd_size)
-            
             # preallocate weight and bias tensors for each partition
             # prevent graph capture & execution failure 
             self.preallocate_weight_tensor_list = [
@@ -1035,14 +1037,17 @@ class LayerNormLinear22(TransformerEngineBaseModule):
         self.ub_name = ub_name
 
         self.eps = eps
+        # use unabriged in_features in bumblebee || mode.
         layer_norm_weight = torch.nn.Parameter(
-            torch.empty(self.in_features, device=device, dtype=params_dtype)
+            torch.empty(self.og_in_features, device=device, dtype=params_dtype)
         )
+        
         self.register_parameter(
             "layer_norm_weight",
             layer_norm_weight,
             init_fn=init_method_constant(float(not self.zero_centered_gamma)),
         )
+
         if self.normalization != "RMSNorm":
             layer_norm_bias = torch.nn.Parameter(
                 torch.empty(self.in_features, device=device, dtype=params_dtype)
@@ -1217,7 +1222,7 @@ class LayerNormLinear22(TransformerEngineBaseModule):
                 for bias in self.bias_names:
                     if self.parallel_mode == "row":
                         setattr(getattr(self, bias), "sequence_parallel", self.sequence_parallel)
-                    elif self.parallel_mode == "column":
+                    elif self.parallel_mode == "column" or self.parallel_mode == "bumblebee":
                         set_tensor_model_parallel_attributes(getattr(self, bias), True, 0, 1)
 
     @no_torch_dynamo()
@@ -1256,6 +1261,9 @@ class LayerNormLinear22(TransformerEngineBaseModule):
         if skip_fp8_weight_update is not None:
             is_first_microbatch = False
 
+        # shard input tensor along sequence dimension here for now. 
+        inp = local_chunk_along_first_dim(inp, self.xcd_group)
+
         with self.prepare_forward(
             inp, allow_non_contiguous=False  # removed .contiguous from inside the layer
         ) as inp:
@@ -1272,11 +1280,11 @@ class LayerNormLinear22(TransformerEngineBaseModule):
                     unfused_weights = [w.dequantize() for w in unfused_weights]
 
             if self.parallel_mode == "bumblebee":
-                weight_tensor, _ = gather_along_last_dim(weight_tensor, self.xcd_group, \
+                weight_tensor, _ = gather_along_last_dim(*unfused_weights, self.xcd_group, \
                                                           False, None, self.preallocate_weight_tensor_list)
-            
-            
-            weight_tensor = noop_cat(unfused_weights)
+                weight_tensor = noop_cat([weight_tensor])
+            else:
+                weight_tensor = noop_cat(unfused_weights)
             if self.use_bias:
                 bias_tensor = noop_cat([getattr(self, name) for name in self.bias_names])
             else:

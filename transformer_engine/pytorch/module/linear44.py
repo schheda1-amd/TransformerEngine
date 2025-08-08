@@ -1066,9 +1066,10 @@ class Linear44(TransformerEngineBaseModule):
                     unfused_weights = [w.dequantize() for w in unfused_weights]
             
             if self.parallel_mode == "bumblebee":
-                weight_tensor, _ = gather_along_first_dim(weight_tensor, self.intra_xcd_group)
-
-            weight_tensor = noop_cat(unfused_weights)
+                weight_tensor, _ = gather_along_first_dim(*unfused_weights, self.intra_xcd_group)
+                weight_tensor = noop_cat([weight_tensor])
+            else:
+                weight_tensor = noop_cat(unfused_weights)
             if self.use_bias:
                 bias_tensor = noop_cat([getattr(self, name) for name in self.bias_names])
             else:
