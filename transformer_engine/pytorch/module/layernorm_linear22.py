@@ -198,7 +198,6 @@ class _LayerNormLinear(torch.autograd.Function):
             )
 
         # Apply normalization
-        #print('normalizer shapes---', inputmat.shape, ln_weight.shape)
         nvtx_range_push(f"{nvtx_label}.norm")
         ln_out, mu, rsigma = apply_normalization(
             inputmat,

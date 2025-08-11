@@ -36,6 +36,7 @@ from ..distributed import (
     get_distributed_world_size,
     allreduce,
     reduce_scatter_along_first_dim,
+    local_chunk_along_first_dim,
     gather_along_first_dim,
     gather_along_last_dim,
     is_fp8_activation_recompute_enabled,
@@ -231,6 +232,7 @@ class _Linear(torch.autograd.Function):
             ub_obj.copy_into_buffer(inputmat_total, input_quantizer, local_chunk=True)
             inputmat_total = ub_obj.get_buffer(input_quantizer)
 
+        #print('--------------- gemm shape: ', inputmat_total.shape, weightmat.shape)
         nvtx_range_push(f"{nvtx_label}.gemm")
         out, *_, rs_out = general_gemm(
             weightmat,
@@ -271,6 +273,7 @@ class _Linear(torch.autograd.Function):
             nvtx_range_pop(f"{nvtx_label}.fsdp_scatter")
 
             # TODO(ksivamani): Check memory usage
+            #print('FWD ********** tensors save? ', saved_inputmat.shape, weightmat.shape, weight.shape)
             tensors_to_save, tensor_objects = prepare_for_saving(
                 saved_inputmat,
                 weightmat,
@@ -341,6 +344,7 @@ class _Linear(torch.autograd.Function):
 
 
         out = out.view(-1, *inp_shape[1:-1], out_features)
+        #print('FWD what should this size look like? ', out.shape)
         return out
 
     @staticmethod
@@ -348,7 +352,13 @@ class _Linear(torch.autograd.Function):
         # pylint: disable=missing-function-docstring
 
         # NVTX label for profiling
+        print('BWD grad_output shape: ', grad_output.shape)
         nvtx_label = "transformer_engine._Linear.backward"
+        if ctx.requires_wgrad and ctx.parallel_mode == "bumblebee":
+            nvtx_range_push(f"{nvtx_label}.bumblebee_grad_splitt")
+            grad_output = local_chunk_along_first_dim(grad_output, ctx.intra_xcd_group)
+            nvtx_range_pop(f"{nvtx_label}.bumblebee_grad_split")
+        
         if ctx.ub_name is not None:
             nvtx_label = f"{nvtx_label}.{ctx.ub_name}"
 
@@ -373,7 +383,7 @@ class _Linear(torch.autograd.Function):
             inputmat, weight_fp8, weight, bias = (  # pylint: disable=unbalanced-tuple-unpacking
                 restore_from_saved(ctx.tensor_objects, saved_tensors)
             )
-
+            #print('BWD ******** does saved_tensors have it? ', inputmat.shape, weight.shape)
             # Since main_grad can be modified inplace, it should not be a part of saved_tensors
             main_grad = (
                 ctx.main_grad
@@ -396,7 +406,7 @@ class _Linear(torch.autograd.Function):
                 weight_fp8,
             )
             nvtx_range_pop(f"{nvtx_label}.fsdp_gather")
-
+            print('inputmat shape now? ', inputmat.shape)
             ctx.ub_obj_gradout = None
             ub_obj_dgrad = None
             ub_obj_wgrad = None
@@ -513,6 +523,7 @@ class _Linear(torch.autograd.Function):
                     bulk_overlap=ctx.ub_bulk_dgrad,
                 )
                 nvtx_range_pop(f"{nvtx_label}.dgrad_gemm")
+                print('last one', dgrad.shape, ctx.inp_shape)
 
                 # Launch tensor-parallel communication
                 if ctx.ub_overlap_rs_dgrad:
@@ -565,6 +576,7 @@ class _Linear(torch.autograd.Function):
                 # wgrad GEMM
                 # Note: Fuse with bgrad computation if needed
                 nvtx_range_push(f"{nvtx_label}.wgrad_gemm")
+                print('BWD ---- gemm shape: > ', inputmat_total.shape, grad_output.shape)
                 wgrad, grad_bias_, _, rs_out = general_gemm(
                     inputmat_total,
                     grad_output,
@@ -591,6 +603,10 @@ class _Linear(torch.autograd.Function):
                     else:
                         dgrad = ub_obj_wgrad.get_buffer(ctx.grad_input_quantizer, local_chunk=True)
 
+                if ctx.parallel_mode == "bumblebee":
+                    wgrad, _ = allreduce(wgrad, ctx.inter_xcd_group)
+                    #print('*^*^*^*^*^*^* bias stuff::> ', type(bias), type(grad_bias))
+                    #grad_bias_ = allreduce(grad_bias_, ctx.inter_xcd_group)
                 if grad_bias is None:
                     grad_bias = grad_bias_
                 del grad_bias_

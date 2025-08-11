@@ -35,8 +35,6 @@ from ..distributed import (
     set_tensor_model_parallel_attributes,
     get_distributed_world_size,
     allreduce,
-    _scatter_along_first_dim,
-    local_chunk_along_first_dim,
     reduce_scatter_along_first_dim,
     gather_along_first_dim,
     is_fp8_activation_recompute_enabled,
@@ -101,9 +99,6 @@ class _Linear(torch.autograd.Function):
         fsdp_group: Union[dist_group_type, None],
         module: torch.nn.Module,
         skip_fp8_weight_update: bool,
-        xcd_group: Union[dist_group_type, None],
-        xcd_size: int,
-        physical_gpu_idx: int,
     ) -> torch.Tensor:
         # pylint: disable=missing-function-docstring
 
@@ -115,6 +110,7 @@ class _Linear(torch.autograd.Function):
         # Make sure input dimensions are compatible
         out_features, in_features = weight.shape
         inp_shape = inp.shape
+        print('qqqqqqqqqqqqqqqq ', inp_shape)
         assert inp_shape[-1] == in_features, "GEMM not possible"
 
         tp_world_size = get_distributed_world_size(tp_group)
@@ -230,6 +226,7 @@ class _Linear(torch.autograd.Function):
             ub_obj.copy_into_buffer(inputmat_total, input_quantizer, local_chunk=True)
             inputmat_total = ub_obj.get_buffer(input_quantizer)
 
+        #print('forward input and weight mat shapes: ', inputmat_total.shape, weightmat.shape)
         nvtx_range_push(f"{nvtx_label}.gemm")
         out, *_, rs_out = general_gemm(
             weightmat,
@@ -244,6 +241,7 @@ class _Linear(torch.autograd.Function):
             extra_output=rs_out,
         )
         nvtx_range_pop(f"{nvtx_label}.gemm")
+        #print('forward output shape: ', out.shape)
 
         if is_grad_enabled:
             saved_inputmat = None
@@ -270,6 +268,9 @@ class _Linear(torch.autograd.Function):
             nvtx_range_pop(f"{nvtx_label}.fsdp_scatter")
 
             # TODO(ksivamani): Check memory usage
+            #print('saving tensors (input, weightmat, weight): ', saved_inputmat.shape, \
+            #        weightmat.shape, weight.shape)
+            print('FWD ********** tensors save? ', saved_inputmat.shape, weightmat.shape, weight.shape)
             tensors_to_save, tensor_objects = prepare_for_saving(
                 saved_inputmat,
                 weightmat,
@@ -307,9 +308,6 @@ class _Linear(torch.autograd.Function):
             ctx.reduce_and_update_bwd_fp8_tensors = False
             ctx.owns_input = saved_inputmat is not inp
             ctx.is_input_fp8 = not own_quantized_input
-            ctx.xcd_group = xcd_group
-            ctx.xcd_size = xcd_size
-            ctx.physical_gpu_ix = physical_gpu_idx
             if ctx.fp8 and requires_grad(inp, weight, bias):
                 _first_fp8_module = FP8GlobalStateManager.IS_FIRST_FP8_MODULE
                 ctx.reduce_and_update_bwd_fp8_tensors = FP8GlobalStateManager.is_first_fp8_module()
@@ -326,26 +324,16 @@ class _Linear(torch.autograd.Function):
             elif tensor_parallel:
                 out, _ = allreduce(out, tp_group)
             nvtx_range_pop(f"{nvtx_label}.row_parallel_comm")
-        elif parallel_mode == "bumblebee":
-            nvtx_range_push(f"{nvtx_label}.row_parallel_comm")
-            out, _ = allreduce(out, tp_group)
-            print('now what shapes are we seeing before?', out.shape)
-            # now scatter among intra gpu group. every rank in tp group has the entire 
-            # output matrix. now we get rid of that and scatter equal size chunks from
-            # rank 0 of each intra_gpu group.  
-            # follow sequence parallel logic for backwards
-            ###out, _ = _scatter_along_first_dim(out, xcd_group)
-            out = local_chunk_along_first_dim(out, xcd_group)
-            print('now what shapes are we seeing after?', out.shape)
-            nvtx_range_pop(f"{nvtx_label}.row_parallel_comm")
 
         out = out.view(-1, *inp_shape[1:-1], out_features)
+        print('FWD what should this size look like? ', out.shape)
         return out
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
         # pylint: disable=missing-function-docstring
 
+        print('BWD grad_output shape: ', grad_output.shape)
         # NVTX label for profiling
         nvtx_label = "transformer_engine._Linear.backward"
         if ctx.ub_name is not None:
@@ -373,6 +361,8 @@ class _Linear(torch.autograd.Function):
                 restore_from_saved(ctx.tensor_objects, saved_tensors)
             )
 
+            #print('does saved_tensors have it? ', inputmat.shape, weight.shape, bias.shape)
+            print('BWD ******** does saved_tensors have it? ', inputmat.shape, weight_fp8.shape, weight.shape)
             # Since main_grad can be modified inplace, it should not be a part of saved_tensors
             main_grad = (
                 ctx.main_grad
@@ -395,6 +385,7 @@ class _Linear(torch.autograd.Function):
                 weight_fp8,
             )
             nvtx_range_pop(f"{nvtx_label}.fsdp_gather")
+            #print('inputmat shape now? ', inputmat.shape)
 
             ctx.ub_obj_gradout = None
             ub_obj_dgrad = None
@@ -489,6 +480,7 @@ class _Linear(torch.autograd.Function):
             dgrad = None
             dgrad_work = None
             if ctx.requires_dgrad:
+                print('+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++')
 
                 # Update quantizer
                 if ctx.grad_input_quantizer is not None:
@@ -512,6 +504,7 @@ class _Linear(torch.autograd.Function):
                     bulk_overlap=ctx.ub_bulk_dgrad,
                 )
                 nvtx_range_pop(f"{nvtx_label}.dgrad_gemm")
+                print('last one', dgrad.shape)
 
                 # Launch tensor-parallel communication
                 if ctx.ub_overlap_rs_dgrad:
@@ -563,6 +556,7 @@ class _Linear(torch.autograd.Function):
 
                 # wgrad GEMM
                 # Note: Fuse with bgrad computation if needed
+                print('BWD ---- gemm shape: > ', inputmat_total.shape, grad_output.shape)
                 nvtx_range_push(f"{nvtx_label}.wgrad_gemm")
                 wgrad, grad_bias_, _, rs_out = general_gemm(
                     inputmat_total,
@@ -583,6 +577,8 @@ class _Linear(torch.autograd.Function):
                     bulk_overlap=ctx.ub_bulk_wgrad,
                 )
                 nvtx_range_pop(f"{nvtx_label}.wgrad_gemm")
+
+                # print('grad_bias shape', type(grad_bias_)) Nonetype
 
                 if ctx.ub_bulk_wgrad:
                     if ub_obj_wgrad.is_fp8_ubuf():
@@ -638,6 +634,7 @@ class _Linear(torch.autograd.Function):
         # Scatter fp8 weight buffers
         if ctx.fp8 and not isinstance(weight, QuantizedTensor):
             _fsdp_scatter_tensors(ctx.fsdp_group, weight_fp8)
+        print('^^^^^^^^^^^^^^^^^^^^^^^^^^', ctx.inp_shape, '^^^^^^^^^^^^^^^^^^^^^^^')
         return (
             wgrad,
             dgrad.view(ctx.inp_shape) if ctx.requires_dgrad else None,
@@ -670,9 +667,6 @@ class _Linear(torch.autograd.Function):
             None,  # fsdp_group
             None,  # module
             None,  # skip_fp8_weight_update
-            None,  # xcd_group
-            None,  # xcd_size
-            None,  # physical_gpu_idx
         )
 
 
@@ -725,7 +719,6 @@ class Linear22(TransformerEngineBaseModule):
                    used to decide whether this Linear layer is Column Parallel Linear or Row
                    Parallel Linear as described `here <https://arxiv.org/pdf/1909.08053.pdf>`_.
                    When set to `None`, no communication is performed.
-                   #AMD Instinct partitioninig modes - 'bumblebee', 'starscream'
 
     Optimization parameters
     -----------------------
@@ -770,9 +763,6 @@ class Linear22(TransformerEngineBaseModule):
         ub_bulk_dgrad: bool = False,
         ub_bulk_wgrad: bool = False,
         ub_name: Optional[str] = None,
-        xcd_group: Optional[dist_group_type] = None,
-        xcd_size: int = 1,
-        physical_gpu_offset: int = 0,
     ) -> None:
         super().__init__()
 
@@ -785,9 +775,6 @@ class Linear22(TransformerEngineBaseModule):
         self.apply_bias = bias and not return_bias
         self.get_rng_state_tracker = get_rng_state_tracker
         self.rng_tracker_name = rng_tracker_name
-        self.xcd_group = xcd_group
-        self.xcd_size = xcd_size
-        self.physical_gpu_idx = physical_gpu_offset
 
         if device == "meta":
             assert parameters_split is None, "Cannot split module parameters on 'meta' device."
@@ -808,8 +795,6 @@ class Linear22(TransformerEngineBaseModule):
         if self.parallel_mode == "column":
             self.out_features = divide(self.out_features, self.tp_size)
         elif self.parallel_mode == "row":
-            self.in_features = divide(self.in_features, self.tp_size)
-        elif self.parallel_mode == "bumblebee": # mimick parallel model "row" until the end.
             self.in_features = divide(self.in_features, self.tp_size)
 
         self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
@@ -968,8 +953,7 @@ class Linear22(TransformerEngineBaseModule):
 
         # For RPL, bias has to be added after TP collectives
         # So it cannot be fused with the GEMM
-        if (self.parallel_mode == "row" or self.parallel_mode == "bumblebee") \
-            and self.apply_bias:
+        if self.parallel_mode == "row" and self.apply_bias:
             self.gemm_bias_unfused_add = True
         else:
             self.gemm_bias_unfused_add = False
@@ -983,7 +967,7 @@ class Linear22(TransformerEngineBaseModule):
                 set_tensor_model_parallel_attributes(
                     tensor=getattr(self, weight),
                     is_parallel=True,
-                    dim=1, # if self.parallel_mode == "row" else 0
+                    dim=1 if self.parallel_mode == "row" else 0,
                     stride=1,
                 )
 
@@ -1104,9 +1088,6 @@ class Linear22(TransformerEngineBaseModule):
                 self.fsdp_group,
                 self,
                 skip_fp8_weight_update,
-                self.xcd_group,
-                self.xcd_size, 
-                self.physical_gpu_idx,
             )
             out = linear_fn(*args)
         if self.gemm_bias_unfused_add:
