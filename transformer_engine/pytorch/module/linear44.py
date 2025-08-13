@@ -356,7 +356,7 @@ class _Linear(torch.autograd.Function):
         nvtx_label = "transformer_engine._Linear.backward"
         if ctx.requires_wgrad and ctx.parallel_mode == "bumblebee":
             nvtx_range_push(f"{nvtx_label}.bumblebee_grad_splitt")
-            grad_output = local_chunk_along_first_dim(grad_output, ctx.intra_xcd_group)
+            grad_output_chunk = local_chunk_along_first_dim(grad_output, ctx.intra_xcd_group)
             nvtx_range_pop(f"{nvtx_label}.bumblebee_grad_split")
         
         if ctx.ub_name is not None:
@@ -509,7 +509,7 @@ class _Linear(torch.autograd.Function):
                 nvtx_range_push(f"{nvtx_label}.dgrad_gemm")
                 dgrad, *_, rs_out = general_gemm(
                     weight_fp8,
-                    grad_output,
+                    grad_output_chunk,
                     get_workspace(),
                     layout="NN",
                     grad=True,
@@ -576,10 +576,10 @@ class _Linear(torch.autograd.Function):
                 # wgrad GEMM
                 # Note: Fuse with bgrad computation if needed
                 nvtx_range_push(f"{nvtx_label}.wgrad_gemm")
-                print('BWD ---- gemm shape: > ', inputmat_total.shape, grad_output.shape)
+                #print('BWD ---- gemm shape: > ', inputmat_total.shape, grad_output.shape)
                 wgrad, grad_bias_, _, rs_out = general_gemm(
                     inputmat_total,
-                    grad_output,
+                    grad_output_chunk,
                     get_workspace(),
                     layout="NT",
                     grad=True,
