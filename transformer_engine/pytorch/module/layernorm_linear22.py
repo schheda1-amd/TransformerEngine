@@ -1260,8 +1260,9 @@ class LayerNormLinear22(TransformerEngineBaseModule):
         if skip_fp8_weight_update is not None:
             is_first_microbatch = False
 
-        # shard input tensor along sequence dimension here for now. 
-        inp = local_chunk_along_first_dim(inp, self.xcd_group)
+        # shard input tensor along sequence dimension here for now.
+        # shouldn't be needed since we added a dummy op before LN+FC1 
+        # inp = local_chunk_along_first_dim(inp, self.xcd_group)
 
         with self.prepare_forward(
             inp, allow_non_contiguous=False  # removed .contiguous from inside the layer
