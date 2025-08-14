@@ -431,6 +431,7 @@ class _LayerNormLinear(torch.autograd.Function):
     ) -> Tuple[Union[torch.Tensor, None], ...]:
         # pylint: disable=missing-function-docstring
 
+        #prinnt("are we even reaching here?????")
         # NVTX label for profiling
         nvtx_label = "transformer_engine._LayerNormLinear.backward"
         if ctx.ub_name is not None:
@@ -541,7 +542,7 @@ class _LayerNormLinear(torch.autograd.Function):
             ) = TransformerEngineBaseModule.grad_output_preprocess(
                 ctx,
                 grad_outputs[0],
-                ctx.parallel_mode == "row",
+                ctx.parallel_mode == "row" or ctx.parallel_mode == "bumblebee",
                 ctx.grad_output_quantizer,
             )
 

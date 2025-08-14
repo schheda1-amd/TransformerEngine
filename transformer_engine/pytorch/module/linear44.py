@@ -340,7 +340,7 @@ class _Linear(torch.autograd.Function):
             # check shapes
             # concat all partial sequences on a physical gpu now.
             # Now all partitions have the same out tensor.
-            out , _ = gather_along_first_dim(out, intra_xcd_group)
+            # out , _ = gather_along_first_dim(out, intra_xcd_group)
 
 
         out = out.view(-1, *inp_shape[1:-1], out_features)
@@ -358,6 +358,8 @@ class _Linear(torch.autograd.Function):
             nvtx_range_push(f"{nvtx_label}.bumblebee_grad_splitt")
             grad_output_chunk = local_chunk_along_first_dim(grad_output, ctx.intra_xcd_group)
             nvtx_range_pop(f"{nvtx_label}.bumblebee_grad_split")
+        else:
+            grad_output_chunk = None
         
         if ctx.ub_name is not None:
             nvtx_label = f"{nvtx_label}.{ctx.ub_name}"
@@ -458,7 +460,7 @@ class _Linear(torch.autograd.Function):
                 grad_bias,
             ) = TransformerEngineBaseModule.grad_output_preprocess(
                 ctx,
-                grad_output,
+                grad_output_chunk,
                 ctx.parallel_mode == "row",
                 ctx.grad_output_quantizer,
             )
@@ -509,7 +511,7 @@ class _Linear(torch.autograd.Function):
                 nvtx_range_push(f"{nvtx_label}.dgrad_gemm")
                 dgrad, *_, rs_out = general_gemm(
                     weight_fp8,
-                    grad_output_chunk,
+                    grad_output,
                     get_workspace(),
                     layout="NN",
                     grad=True,
@@ -579,7 +581,7 @@ class _Linear(torch.autograd.Function):
                 #print('BWD ---- gemm shape: > ', inputmat_total.shape, grad_output.shape)
                 wgrad, grad_bias_, _, rs_out = general_gemm(
                     inputmat_total,
-                    grad_output_chunk,
+                    grad_output,
                     get_workspace(),
                     layout="NT",
                     grad=True,
